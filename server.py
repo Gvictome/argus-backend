@@ -14,6 +14,11 @@ CORS(app)
 detections_log = []
 alerts_log = []
 recordings_log = []
+
+# Shared frame buffer for live stream (fed by detection pipeline)
+latest_frame = None
+frame_lock = threading.Lock()
+frame_event = threading.Event()
 cameras = {
     "front_porch": {
         "name": "Front Porch",
@@ -72,52 +77,37 @@ def analyze_with_ollama(detection):
         alerts_log.pop(0)
 
 
+@app.route("/api/frame", methods=["POST"])
+def post_frame():
+    """Receive a JPEG frame from the detection pipeline."""
+    global latest_frame
+    if request.content_type and "image/jpeg" in request.content_type:
+        frame_data = request.data
+    else:
+        frame_data = request.data
+    if not frame_data:
+        return jsonify({"error": "no frame data"}), 400
+    with frame_lock:
+        latest_frame = frame_data
+    frame_event.set()
+    return jsonify({"status": "ok"})
+
+
 def generate_mjpeg():
-    """Stream MJPEG from Pi camera using libcamera"""
-    process = subprocess.Popen(
-        [
-            "libcamera-vid",
-            "--codec", "mjpeg",
-            "--width", "640",
-            "--height", "480",
-            "--framerate", "15",
-            "--timeout", "0",
-            "--nopreview",
-            "-o", "-"
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
-    )
-
-    boundary = b"--frame\r\n"
-    buf = b""
-
-    try:
-        while True:
-            chunk = process.stdout.read(4096)
-            if not chunk:
-                break
-            buf += chunk
-
-            # Find JPEG frames (start with FFD8, end with FFD9)
-            while True:
-                start = buf.find(b'\xff\xd8')
-                end = buf.find(b'\xff\xd9', start + 2) if start != -1 else -1
-
-                if start == -1 or end == -1:
-                    break
-
-                frame = buf[start:end + 2]
-                buf = buf[end + 2:]
-
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" +
-                    frame +
-                    b"\r\n"
-                )
-    finally:
-        process.terminate()
+    """Yield MJPEG frames from the shared buffer (fed by detection pipeline)."""
+    while True:
+        frame_event.wait(timeout=2.0)
+        with frame_lock:
+            frame = latest_frame
+        if frame is None:
+            continue
+        frame_event.clear()
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" +
+            frame +
+            b"\r\n"
+        )
 
 
 @app.route("/api/stream")
@@ -225,7 +215,7 @@ def trigger_recording():
     try:
         recording_process = subprocess.Popen(
             [
-                "libcamera-vid",
+                "rpicam-vid",
                 "--width", "1280",
                 "--height", "720",
                 "--framerate", "30",

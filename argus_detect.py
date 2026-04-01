@@ -4,6 +4,7 @@ from gi.repository import Gst
 import requests
 import threading
 import time
+import io
 import numpy as np
 import hailo
 
@@ -17,6 +18,7 @@ from hailo_apps.python.core.gstreamer.gstreamer_app import app_callback_class
 # --- Configuration ---
 ARGUS_API = "http://localhost:5000/api/detections"
 RECORD_API = "http://localhost:5000/api/record"
+FRAME_API = "http://localhost:5000/api/frame"
 PIR_GPIO_PIN = 17
 PERSON_CONFIDENCE_THRESHOLD = 0.60
 MOTION_COOLDOWN = 30  # seconds to keep running after last motion
@@ -123,13 +125,28 @@ def app_callback(element, buffer, user_data):
             print("[ARGUS] Idle — waiting for PIR motion...")
         return
 
-    # Get frame for software motion detection (every 5th frame)
+    # Get frame for software motion detection and live stream (every 3rd frame)
     pad = element.get_static_pad("src")
     fmt, width, height = get_caps_from_pad(pad)
     frame = None
-    if fmt and width and height and user_data.frame_count % 5 == 0:
+    if fmt and width and height and user_data.frame_count % 3 == 0:
         try:
             frame = get_numpy_from_buffer(buffer, fmt, width, height)
+        except Exception:
+            pass
+
+    # Send frame to API for live stream
+    if frame is not None and user_data.frame_count % 3 == 0:
+        try:
+            from PIL import Image
+            img = Image.fromarray(frame)
+            buf_io = io.BytesIO()
+            img.save(buf_io, format='JPEG', quality=70)
+            threading.Thread(
+                target=lambda d: requests.post(FRAME_API, data=d, headers={"Content-Type": "image/jpeg"}, timeout=0.3),
+                args=(buf_io.getvalue(),),
+                daemon=True
+            ).start()
         except Exception:
             pass
 
