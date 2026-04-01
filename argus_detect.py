@@ -119,13 +119,7 @@ def app_callback(element, buffer, user_data):
 
     user_data.frame_count += 1
 
-    # Check PIR first — if no hardware motion, skip everything
-    if not user_data.pir.is_active():
-        if user_data.frame_count % 100 == 0:
-            print("[ARGUS] Idle — waiting for PIR motion...")
-        return
-
-    # Get frame for software motion detection and live stream (every 3rd frame)
+    # Always grab and stream frames for live view (every 3rd frame)
     pad = element.get_static_pad("src")
     fmt, width, height = get_caps_from_pad(pad)
     frame = None
@@ -135,8 +129,7 @@ def app_callback(element, buffer, user_data):
         except Exception:
             pass
 
-    # Send frame to API for live stream
-    if frame is not None and user_data.frame_count % 3 == 0:
+    if frame is not None:
         try:
             from PIL import Image
             img = Image.fromarray(frame)
@@ -149,6 +142,12 @@ def app_callback(element, buffer, user_data):
             ).start()
         except Exception:
             pass
+
+    # Check PIR — if no motion, skip detection (but stream still runs above)
+    if not user_data.pir.is_active():
+        if user_data.frame_count % 100 == 0:
+            print("[ARGUS] Idle — waiting for PIR motion...")
+        return
 
     # Check software motion detection
     if not user_data.sw_motion.check(frame):
