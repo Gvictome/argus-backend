@@ -5,3 +5,5 @@ recordings/
 *.h264
 *.mp4
 .env
+models/
+fl_data/

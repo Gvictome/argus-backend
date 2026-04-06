@@ -1,8 +1,6 @@
 flask
 flask-cors
-requests
 prometheus-client
-psutil
 flwr
 numpy
-scipy
+gunicorn

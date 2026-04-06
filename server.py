@@ -1,5 +1,10 @@
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
+from prometheus_client import (
+    Counter, Gauge, Histogram, Summary, Info,
+    generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry, REGISTRY,
+    start_http_server as prom_start_http_server,
+)
 import requests
 import datetime
 import threading
@@ -7,9 +12,101 @@ import subprocess
 import os
 import signal
 import time
+import psutil
 
 app = Flask(__name__)
 CORS(app)
+
+# ─── Prometheus Metrics ─────────────────────────────────────────────
+DETECTION_COUNTER = Counter(
+    'argus_detections_total',
+    'Total object detections',
+    ['label', 'camera']
+)
+ALERT_COUNTER = Counter(
+    'argus_alerts_total',
+    'Total alerts generated',
+    ['type', 'camera']
+)
+DETECTION_CONFIDENCE = Histogram(
+    'argus_detection_confidence',
+    'Detection confidence distribution',
+    ['label'],
+    buckets=[0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0]
+)
+ACTIVE_CAMERAS = Gauge(
+    'argus_active_cameras',
+    'Number of active cameras'
+)
+IS_RECORDING = Gauge(
+    'argus_is_recording',
+    'Whether the system is currently recording (1=yes)'
+)
+RECORDINGS_TOTAL = Counter(
+    'argus_recordings_total',
+    'Total recordings triggered',
+    ['trigger']
+)
+OLLAMA_LATENCY = Histogram(
+    'argus_ollama_analysis_seconds',
+    'Ollama analysis response time',
+    buckets=[0.5, 1, 2, 5, 10, 20, 30]
+)
+OLLAMA_ERRORS = Counter(
+    'argus_ollama_errors_total',
+    'Total Ollama analysis failures'
+)
+FRAME_POST_COUNTER = Counter(
+    'argus_frames_received_total',
+    'Total frames received from detection pipeline'
+)
+# Federated learning metrics (ready for FL module)
+FL_ROUND = Gauge('argus_fl_current_round', 'Current federated learning round')
+FL_LOCAL_LOSS = Gauge('argus_fl_local_loss', 'Local training loss from last FL round')
+FL_MODEL_VERSION = Gauge('argus_fl_model_version', 'Current model version/generation')
+FL_PEERS = Gauge('argus_fl_connected_peers', 'Number of connected FL peers')
+# WiFi CSI metrics (ready for CSI module)
+WIFI_CSI_MOTION = Gauge('argus_wifi_csi_motion_detected', 'WiFi CSI motion detected (1=yes)')
+WIFI_CSI_AMPLITUDE = Gauge('argus_wifi_csi_mean_amplitude', 'Mean CSI subcarrier amplitude')
+WIFI_CSI_PERSONS = Gauge('argus_wifi_csi_estimated_persons', 'Estimated person count from WiFi CSI')
+# System metrics
+SYSTEM_CPU = Gauge('argus_system_cpu_percent', 'System CPU usage percent')
+SYSTEM_MEMORY = Gauge('argus_system_memory_percent', 'System memory usage percent')
+SYSTEM_TEMP = Gauge('argus_system_cpu_temp_celsius', 'CPU temperature in Celsius')
+NODE_INFO = Info('argus_node', 'Argus node information')
+
+
+def collect_system_metrics():
+    """Background thread to collect system metrics every 5 seconds."""
+    while True:
+        try:
+            SYSTEM_CPU.set(psutil.cpu_percent(interval=1))
+            SYSTEM_MEMORY.set(psutil.virtual_memory().percent)
+            # CPU temp — works on Pi, may not on laptop
+            try:
+                temps = psutil.sensors_temperatures()
+                if temps:
+                    for name, entries in temps.items():
+                        if entries:
+                            SYSTEM_TEMP.set(entries[0].current)
+                            break
+            except (AttributeError, KeyError):
+                pass
+        except Exception:
+            pass
+        time.sleep(5)
+
+
+# Start system metrics collection
+_sys_thread = threading.Thread(target=collect_system_metrics, daemon=True)
+_sys_thread.start()
+
+import socket
+NODE_INFO.info({
+    'hostname': socket.gethostname(),
+    'version': '0.3.0',
+    'role': 'edge_node',
+})
 
 detections_log = []
 alerts_log = []
@@ -57,13 +154,15 @@ def analyze_with_ollama(detection):
     )
 
     try:
-        resp = requests.post(OLLAMA_URL, json={
-            "model": "tinyllama",
-            "prompt": prompt,
-            "stream": False
-        }, timeout=30)
+        with OLLAMA_LATENCY.time():
+            resp = requests.post(OLLAMA_URL, json={
+                "model": "tinyllama",
+                "prompt": prompt,
+                "stream": False
+            }, timeout=30)
         analysis = resp.json().get("response", "Analysis unavailable")
     except Exception as e:
+        OLLAMA_ERRORS.inc()
         analysis = f"Analysis failed: {str(e)}"
 
     alert = {
@@ -73,14 +172,25 @@ def analyze_with_ollama(detection):
         "timestamp": now.isoformat(),
     }
     alerts_log.append(alert)
+    ALERT_COUNTER.labels(type="ai_analysis", camera=detection.get("camera", "front_porch")).inc()
     if len(alerts_log) > 200:
         alerts_log.pop(0)
+
+
+@app.route("/metrics")
+def metrics():
+    """Prometheus metrics endpoint."""
+    ACTIVE_CAMERAS.set(sum(1 for c in cameras.values() if c.get("status") == "active"))
+    is_rec = 1 if (recording_process and recording_process.poll() is None) else 0
+    IS_RECORDING.set(is_rec)
+    return Response(generate_latest(REGISTRY), mimetype=CONTENT_TYPE_LATEST)
 
 
 @app.route("/api/frame", methods=["POST"])
 def post_frame():
     """Receive a JPEG frame from the detection pipeline."""
     global latest_frame
+    FRAME_POST_COUNTER.inc()
     if request.content_type and "image/jpeg" in request.content_type:
         frame_data = request.data
     else:
@@ -142,6 +252,13 @@ def add_detection():
         data["camera"] = "front_porch"
     detections_log.append(data)
 
+    # Prometheus: track detection
+    camera = data.get("camera", "front_porch")
+    label = data.get("label", "unknown")
+    DETECTION_COUNTER.labels(label=label, camera=camera).inc()
+    if "confidence" in data:
+        DETECTION_CONFIDENCE.labels(label=label).observe(data["confidence"])
+
     if len(detections_log) > 500:
         detections_log.pop(0)
 
@@ -154,10 +271,23 @@ def add_detection():
             "timestamp": data["timestamp"],
         }
         alerts_log.append(alert)
+        ALERT_COUNTER.labels(type="detection", camera=camera).inc()
         if len(alerts_log) > 200:
             alerts_log.pop(0)
 
         threading.Thread(target=analyze_with_ollama, args=(data,), daemon=True).start()
+
+    # Feed to federated learning
+    if _fl_client:
+        feed_detection(data)
+
+    # Feed to sensor fusion
+    if data.get("label") == "person":
+        update_camera_state(
+            detected=True,
+            label=data.get("label", ""),
+            confidence=data.get("confidence", 0.0),
+        )
 
     return jsonify({"status": "ok"})
 
@@ -250,6 +380,8 @@ def trigger_recording():
             "analysis": f"Recording triggered by {trigger} detection (confidence: {confidence}). Saving {RECORDING_DURATION}s clip.",
         })
 
+        RECORDINGS_TOTAL.labels(trigger=trigger).inc()
+        IS_RECORDING.set(1)
         print(f"[RECORD] Started recording: {filename}")
         return jsonify({"status": "recording_started", "filename": filename})
     except Exception as e:
@@ -285,8 +417,102 @@ def status():
         "is_recording": is_recording,
         "alert_labels": ALERT_LABELS,
         "cameras": cameras,
+        "metrics_endpoint": "/metrics",
+        "fl_round": FL_ROUND._value.get(),
+        "fl_peers": FL_PEERS._value.get(),
     })
 
 
+# ─── Federated Learning Integration ─────────────────────────────────
+from federated import init_federated, feed_detection, get_fl_status
+
+_fl_client = None
+
+
+def start_fl():
+    """Initialize federated learning subsystem."""
+    global _fl_client
+    try:
+        _fl_client = init_federated(prometheus_metrics={
+            "fl_round": FL_ROUND,
+            "fl_loss": FL_LOCAL_LOSS,
+            "fl_version": FL_MODEL_VERSION,
+            "fl_peers": FL_PEERS,
+        })
+        print("[FL] Federated learning initialized")
+    except Exception as e:
+        print(f"[FL] Init failed (non-fatal): {e}")
+
+
+@app.route("/api/fl/status", methods=["GET"])
+def fl_status():
+    return jsonify(get_fl_status())
+
+
+# ─── WiFi CSI Integration ────────────────────────────────────────────
+from wifi_csi import init_wifi_csi, get_csi_status, get_recent_detections as get_csi_detections
+from sensor_fusion import (
+    get_fused_status, get_fusion_history,
+    update_wifi_state, update_camera_state,
+)
+
+_csi_engine = None
+
+
+def start_wifi_csi():
+    """Initialize WiFi CSI subsystem."""
+    global _csi_engine
+    try:
+        _csi_engine = init_wifi_csi(prometheus_metrics={
+            "motion": WIFI_CSI_MOTION,
+            "amplitude": WIFI_CSI_AMPLITUDE,
+            "persons": WIFI_CSI_PERSONS,
+        })
+        print("[CSI] WiFi CSI engine initialized")
+
+        # Start a thread to bridge CSI events to sensor fusion
+        def _csi_to_fusion():
+            while True:
+                try:
+                    if _csi_engine:
+                        update_wifi_state(
+                            motion=_csi_engine.motion_detected,
+                            confidence=0.7 if _csi_engine.motion_detected else 0.0,
+                            activity=_csi_engine.current_activity,
+                            persons=_csi_engine.person_count,
+                        )
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+        threading.Thread(target=_csi_to_fusion, daemon=True).start()
+    except Exception as e:
+        print(f"[CSI] Init failed (non-fatal): {e}")
+
+
+@app.route("/api/wifi/status", methods=["GET"])
+def wifi_status():
+    return jsonify(get_csi_status())
+
+
+@app.route("/api/wifi/detections", methods=["GET"])
+def wifi_detections():
+    limit = request.args.get("limit", 20, type=int)
+    return jsonify(get_csi_detections(limit))
+
+
+@app.route("/api/fusion/status", methods=["GET"])
+def fusion_status():
+    return jsonify(get_fused_status())
+
+
+@app.route("/api/fusion/history", methods=["GET"])
+def fusion_history():
+    limit = request.args.get("limit", 50, type=int)
+    return jsonify(get_fusion_history(limit))
+
+
 if __name__ == "__main__":
+    start_fl()
+    start_wifi_csi()
     app.run(host="0.0.0.0", port=5000)
