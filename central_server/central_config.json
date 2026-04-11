@@ -7,7 +7,7 @@
     "local_epochs": 3,
     "batch_size": 16,
     "learning_rate": 0.001,
-    "checkpoint_dir": "/data/checkpoints",
+    "checkpoint_dir": "./checkpoints",
     "auth_token": "",
     "node_scrape_targets": []
 }

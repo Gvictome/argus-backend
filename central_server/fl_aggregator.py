@@ -601,12 +601,15 @@ def main():
     logger.info(f"Auth:      {'enabled' if config.get('auth_token') else 'disabled'}")
     logger.info("=" * 60)
 
-    # Start Flower server in background thread
-    fl_thread = threading.Thread(target=start_flower_server, daemon=True)
-    fl_thread.start()
+    # Start REST API in background thread (Flask is thread-safe)
+    api_thread = threading.Thread(
+        target=lambda: api.run(host="0.0.0.0", port=config["api_port"], use_reloader=False),
+        daemon=True,
+    )
+    api_thread.start()
 
-    # Start REST API (foreground)
-    api.run(host="0.0.0.0", port=config["api_port"])
+    # Start Flower server in main thread (requires main thread for signal handlers)
+    start_flower_server()
 
 
 if __name__ == "__main__":
